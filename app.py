@@ -54,19 +54,27 @@ def section_anchor(title, anchor):
 
 # ---------- Sidebar controls ----------
 st.sidebar.header("Controls")
-model_name = st.sidebar.selectbox("Model (local)", ["gpt2"], index=0)
+model_name = st.sidebar.selectbox("Model (local)", ["meta-llama/Llama-3.2-3B"], index=0)
 temperature = st.sidebar.slider("Sampling temperature", 0.1, 1.5, 0.8, 0.05)
 num_candidates = st.sidebar.slider("Number of candidates shown (top-k)", 5, 40, 20)
 speed = st.sidebar.slider("Transformer animation speed (0.0 fastest)", 0.0, 1.0, 0.25, 0.05)
 
 # ---------- Cache model + tokenizer ----------
 @st.cache_resource(show_spinner=False)
-def load_model_and_tokenizer(mname):
+def load_model_and_tokenizer(mname="meta-llama/Llama-3.2-3B"):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
     tokenizer = AutoTokenizer.from_pretrained(mname)
-    model = AutoModelForCausalLM.from_pretrained(mname)
+    model = AutoModelForCausalLM.from_pretrained(
+        mname,
+        load_in_8bit=True,
+        device_map="auto"
+    )
+
     model.eval()
-    # Keep in CPU (if you have GPU, you can move to cuda: model.to("cuda"))
     return model, tokenizer
+
 
 model, tokenizer = load_model_and_tokenizer(model_name)
 
@@ -89,11 +97,14 @@ def encode_text_with_gpt2(text):
 def compute_next_token_and_probs(context_text, temp=1.0, top_k=20):
     """
     Returns: next_token_str, topk_candidates(list of str), topk_probs(list of floats)
-    We compute logits for the last position and sample one token using temperature.
+    Ensures tensors and model are on the same device.
     """
-    # Tokenize
-    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
-    input_ids = inputs["input_ids"]  # shape [1, seq_len]
+    device = next(model.parameters()).device  # detect where the model is (CPU or GPU)
+    
+    # Tokenize and move input_ids to the same device
+    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False).to(device)
+    input_ids = inputs["input_ids"]
+
     with torch.no_grad():
         outputs = model(input_ids)
         logits = outputs.logits  # shape [1, seq_len, vocab_size]
@@ -103,7 +114,7 @@ def compute_next_token_and_probs(context_text, temp=1.0, top_k=20):
         last_logits = last_logits / temp
 
         # get probabilities
-        probs = torch.softmax(last_logits, dim=-1)  # shape [vocab_size]
+        probs = torch.softmax(last_logits, dim=-1)
 
         # top-k
         topk = torch.topk(probs, k=top_k)
@@ -111,11 +122,12 @@ def compute_next_token_and_probs(context_text, temp=1.0, top_k=20):
         top_vals = topk.values.cpu().tolist()
         top_tokens = [tokenizer.decode([tid]) for tid in top_ids]
 
-        # sample 1 token from full distribution (to allow diversity)
+        # sample 1 token from full distribution
         next_id = torch.multinomial(probs, num_samples=1).item()
         next_token = tokenizer.decode([next_id])
 
     return next_token, top_tokens, top_vals
+
 
 # ---------- Preset prompts ----------
 preset_prompts = [
@@ -190,16 +202,30 @@ if generate_clicked:
             next_token, top_tokens, top_probs = compute_next_token_and_probs(context_text=context, temp=temperature, top_k=max(num_candidates, 20))
         except Exception as e:
             st.error(f"Model inference failed: {e}")
-            # fallback simple sampler
-            next_token = random.choice(["the","a","story","world","time","data","love","storm","new","city"])
-            top_tokens = [next_token] + random.sample(["the","a","an","this","that","story","storm","love","data","model","city","night","light","voice","people","world"], k=max(0, num_candidates-1))
-            top_probs = [0.5] + [0.5/(len(top_tokens)-1)]*(len(top_tokens)-1)
+            # --- safer fallback sampler ---
+            # small fallback pool of tokens
+            fallback_pool = ["the","a","story","world","time","data","love","storm","new","city",
+                             "this","that","an","model","people","night","light","voice","city","found"]
 
-        # Append token (spacing heuristics)
-        if next_token.startswith(" "):
-            st.session_state['output'] += next_token
-        else:
-            st.session_state['output'] = (st.session_state['output'] + " " + next_token).strip()
+            # choose a next_token randomly
+            next_token = random.choice(fallback_pool)
+
+            # Build a candidate list that includes the chosen token followed by unique samples from pool
+            # ensure we never sample more items than available
+            remaining_pool = [p for p in fallback_pool if p != next_token]
+            k = max(0, min(len(remaining_pool), num_candidates - 1))
+            sampled = random.sample(remaining_pool, k=k) if k > 0 else []
+            top_tokens = [next_token] + sampled
+
+            # Create pseudo-probabilities: give the chosen token a higher weight, rest equal-shared
+            if len(top_tokens) > 1:
+                top_probs = [0.45] + [round((0.55 / (len(top_tokens) - 1)), 6)] * (len(top_tokens) - 1)
+            else:
+                top_probs = [1.0]
+
+            # In case num_candidates was larger than pool size, pad the lists if you want stable UI length
+            # but usually we keep lengths equal to actual candidate count
+
 
         # update tokenization lists
         ids, strs = encode_text_with_gpt2(st.session_state['output'])
