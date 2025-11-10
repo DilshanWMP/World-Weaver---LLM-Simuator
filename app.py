@@ -1,7 +1,7 @@
 # app.py
 """
-Word Weaver - Local GPT-2 demo (Streamlit)
-- Runs GPT-2 locally with transformers + torch (CPU)
+Word Weaver - Local LLaMA demo (Streamlit)
+- Runs a local HF model (Llama-3.2-3B or other) with GPU if available.
 - Generates one token at a time using model logits + sampling
 - Shows tokens table, 3D token flow visualization, and top-k probabilities
 """
@@ -16,8 +16,16 @@ import streamlit.components.v1 as components
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# Attempt to import BitsAndBytesConfig if available
+try:
+    from transformers import BitsAndBytesConfig
+    BNB_AVAILABLE = True
+except Exception:
+    BitsAndBytesConfig = None
+    BNB_AVAILABLE = False
+
 # ---------- Page config & CSS ----------
-st.set_page_config(page_title="Word Weaver - LLM Simulator (Local GPT-2)", layout="wide")
+st.set_page_config(page_title="Word Weaver - LLM Simulator (Local)", layout="wide")
 
 NAVBAR = """
 <style>
@@ -37,7 +45,7 @@ NAVBAR = """
 </style>
 
 <div id="topnav">
-  <div class="title">🧵 <span>Word Weaver - LLM Simulator (Local GPT-2)</span></div>
+  <div class="title">🧵 <span>Word Weaver - LLM Simulator (Local)</span></div>
   <a href="#input-output">Input / Output</a>
   <a href="#tokens">Generated Tokens</a>
   <a href="#transformer">Transformer Layers</a>
@@ -54,29 +62,63 @@ def section_anchor(title, anchor):
 
 # ---------- Sidebar controls ----------
 st.sidebar.header("Controls")
-model_name = st.sidebar.selectbox("Model (local)", ["meta-llama/Llama-3.2-3B"], index=0)
+MODEL_CHOICES = ["meta-llama/Llama-3.2-3B"]  # add other local HF ids if you like
+model_name = st.sidebar.selectbox("Model (local)", MODEL_CHOICES, index=0)
 temperature = st.sidebar.slider("Sampling temperature", 0.1, 1.5, 0.8, 0.05)
-num_candidates = st.sidebar.slider("Number of candidates shown (top-k)", 5, 40, 20)
+num_candidates = st.sidebar.slider("Number of candidates shown (top-k)", 2, 20, 8)
 speed = st.sidebar.slider("Transformer animation speed (0.0 fastest)", 0.0, 1.0, 0.25, 0.05)
 
 # ---------- Cache model + tokenizer ----------
 @st.cache_resource(show_spinner=False)
-def load_model_and_tokenizer(mname="meta-llama/Llama-3.2-3B"):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    import torch
+def load_model_and_tokenizer(mname: str):
+    """
+    Load model and tokenizer. Try 8-bit/4-bit quantization if bitsandbytes is available,
+    otherwise load fp16 on GPU or float32 on CPU.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(mname, use_fast=False)
 
-    tokenizer = AutoTokenizer.from_pretrained(mname)
-    model = AutoModelForCausalLM.from_pretrained(
-        mname,
-        load_in_8bit=True,
-        device_map="auto"
-    )
+    has_cuda = torch.cuda.is_available()
+    # Prefer quantized model if bitsandbytes present and CUDA available
+    if BNB_AVAILABLE and has_cuda:
+        try:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=False,   # keep False here; use 8-bit config below for safety
+                load_in_8bit=True
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                mname,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            return model, tokenizer
+        except Exception as e:
+            st.warning(f"bitsandbytes quant load failed: {e} — falling back to fp16/auto.")
 
-    model.eval()
+    # Try fp16 with device_map auto if CUDA available
+    if has_cuda:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                mname,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            )
+            return model, tokenizer
+        except Exception as e:
+            st.warning(f"fp16 load failed: {e} — falling back to CPU.")
+
+    # CPU fallback
+    model = AutoModelForCausalLM.from_pretrained(mname, trust_remote_code=True)
     return model, tokenizer
 
-
-model, tokenizer = load_model_and_tokenizer(model_name)
+# load model/tokenizer (this may take time on first run)
+with st.spinner("Loading model and tokenizer (may take a while on first run)..."):
+    try:
+        model, tokenizer = load_model_and_tokenizer(model_name)
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        st.stop()
 
 # ---------- Session state ----------
 if 'prompt' not in st.session_state: st.session_state['prompt'] = ""
@@ -88,46 +130,64 @@ if 'probs' not in st.session_state: st.session_state['probs'] = []
 if 'last_token' not in st.session_state: st.session_state['last_token'] = ""
 
 # ---------- Utilities ----------
-def encode_text_with_gpt2(text):
-    # returns list of token ids and token strings
+def encode_text(text):
+    """Return token ids and token strings for display"""
     ids = tokenizer.encode(text, add_special_tokens=False)
     token_strs = [tokenizer.decode([i]) for i in ids]
     return ids, token_strs
 
+def get_model_device():
+    """
+    Return the main device where inference should be run.
+    If model.parameters are on a single device, return that.
+    If model is sharded, prefer cuda if available.
+    """
+    try:
+        dev = next(model.parameters()).device
+        # if model is mapped to 'meta' or distributed, prefer first CUDA if available
+        if str(dev).startswith("meta") or str(dev).startswith("cpu"):
+            if torch.cuda.is_available():
+                return torch.device("cuda:0")
+            else:
+                return torch.device("cpu")
+        return dev
+    except Exception:
+        return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
 def compute_next_token_and_probs(context_text, temp=1.0, top_k=20):
     """
-    Returns: next_token_str, topk_candidates(list of str), topk_probs(list of floats)
-    Ensures tensors and model are on the same device.
+    Compute next token and top-k probabilities. Moves inputs to proper device.
+    Returns: next_token_str, topk_tokens(list of str), topk_probs(list of floats)
     """
-    device = next(model.parameters()).device  # detect where the model is (CPU or GPU)
-    
-    # Tokenize and move input_ids to the same device
-    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False).to(device)
-    input_ids = inputs["input_ids"]
+    device = get_model_device()
+
+    # Tokenize -> prepare input tensors and move to device
+    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs["input_ids"].to(device)
 
     with torch.no_grad():
         outputs = model(input_ids)
-        logits = outputs.logits  # shape [1, seq_len, vocab_size]
-        last_logits = logits[0, -1]  # tensor of shape [vocab_size]
+        logits = outputs.logits   # shape [1, seq_len, vocab_size]
+        last_logits = logits[0, -1]  # [vocab_size] on same device as model
 
-        # apply temperature
-        last_logits = last_logits / temp
+        # apply temperature safely
+        last_logits = last_logits / max(1e-8, float(temp))
 
-        # get probabilities
         probs = torch.softmax(last_logits, dim=-1)
 
-        # top-k
-        topk = torch.topk(probs, k=top_k)
+        # cap top_k to vocab size
+        vocab_size = probs.shape[0]
+        k = min(int(top_k), int(vocab_size))
+        topk = torch.topk(probs, k=k)
         top_ids = topk.indices.cpu().tolist()
         top_vals = topk.values.cpu().tolist()
         top_tokens = [tokenizer.decode([tid]) for tid in top_ids]
 
-        # sample 1 token from full distribution
+        # sample 1 token from full distribution (to allow diversity)
         next_id = torch.multinomial(probs, num_samples=1).item()
         next_token = tokenizer.decode([next_id])
 
     return next_token, top_tokens, top_vals
-
 
 # ---------- Preset prompts ----------
 preset_prompts = [
@@ -152,7 +212,7 @@ with col1:
         if preset_cols[i].button(p):
             st.session_state['prompt'] = p
             st.session_state['output'] = p
-            ids, strs = encode_text_with_gpt2(p)
+            ids, strs = encode_text(p)
             st.session_state['token_ids'] = ids
             st.session_state['tokens'] = strs
 
@@ -176,7 +236,7 @@ with col1:
         st.session_state['prompt'] = prompt_input
         if prompt_input.strip():
             st.session_state['output'] = prompt_input
-            ids, strs = encode_text_with_gpt2(prompt_input)
+            ids, strs = encode_text(prompt_input)
             st.session_state['token_ids'] = ids
             st.session_state['tokens'] = strs
     st.markdown("</div>", unsafe_allow_html=True)
@@ -199,45 +259,42 @@ if generate_clicked:
         st.warning("Please type a prompt or choose a preset before generating.")
     else:
         try:
-            next_token, top_tokens, top_probs = compute_next_token_and_probs(context_text=context, temp=temperature, top_k=max(num_candidates, 20))
+            # compute next token & candidates
+            next_token, top_tokens, top_probs = compute_next_token_and_probs(context_text=context, temp=temperature, top_k=num_candidates)
         except Exception as e:
             st.error(f"Model inference failed: {e}")
             # --- safer fallback sampler ---
-            # small fallback pool of tokens
             fallback_pool = ["the","a","story","world","time","data","love","storm","new","city",
-                             "this","that","an","model","people","night","light","voice","city","found"]
-
-            # choose a next_token randomly
+                             "this","that","an","model","people","night","light","voice","found"]
             next_token = random.choice(fallback_pool)
-
-            # Build a candidate list that includes the chosen token followed by unique samples from pool
-            # ensure we never sample more items than available
             remaining_pool = [p for p in fallback_pool if p != next_token]
             k = max(0, min(len(remaining_pool), num_candidates - 1))
             sampled = random.sample(remaining_pool, k=k) if k > 0 else []
             top_tokens = [next_token] + sampled
-
-            # Create pseudo-probabilities: give the chosen token a higher weight, rest equal-shared
             if len(top_tokens) > 1:
                 top_probs = [0.45] + [round((0.55 / (len(top_tokens) - 1)), 6)] * (len(top_tokens) - 1)
             else:
                 top_probs = [1.0]
 
-            # In case num_candidates was larger than pool size, pad the lists if you want stable UI length
-            # but usually we keep lengths equal to actual candidate count
-
+        # Append token (spacing heuristics)
+        if next_token.startswith(" "):
+            st.session_state['output'] += next_token
+        else:
+            st.session_state['output'] = (st.session_state['output'] + " " + next_token).strip()
 
         # update tokenization lists
-        ids, strs = encode_text_with_gpt2(st.session_state['output'])
+        ids, strs = encode_text(st.session_state['output'])
         st.session_state['token_ids'] = ids
         st.session_state['tokens'] = strs
 
         # update candidates/probs (convert probabilities to python floats)
-        st.session_state['candidates'] = top_tokens[:num_candidates]
-        # normalize top_probs slice
-        top_probs = top_probs[:num_candidates]
-        s = sum(top_probs) or 1.0
-        normalized = [float(p/s) for p in top_probs]
+        # ensure lengths are consistent and not larger than num_candidates
+        final_cands = top_tokens[:num_candidates]
+        final_probs = (top_probs[:num_candidates] if 'top_probs' in locals() else [1.0])
+        # normalize
+        s = sum(final_probs) or 1.0
+        normalized = [float(p / s) for p in final_probs]
+        st.session_state['candidates'] = final_cands
         st.session_state['probs'] = normalized
         st.session_state['last_token'] = next_token
         time.sleep(max(0.01, 0.08 * speed))
@@ -253,7 +310,6 @@ with st.container():
             "token_text": st.session_state['tokens'],
             "token_id": st.session_state['token_ids']
         })
-        # use width='stretch' recommended in new Streamlit versions
         st.dataframe(df, width='stretch', height=260)
     else:
         st.info("No tokens yet. Type a prompt and click Generate Next Token.")
@@ -270,7 +326,7 @@ with st.container():
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script>
     (function(){
-        const tokens = _TOKENS_;
+        const tokens = __TOKENS__;
         const container = document.getElementById('trf');
         const width = container.clientWidth || 900;
         const height = 380;
@@ -325,7 +381,7 @@ with st.container():
     })();
     </script>
     '''
-    html_code = html_template.replace('_TOKENS_', json.dumps(js_tokens))
+    html_code = html_template.replace('__TOKENS__', json.dumps(js_tokens))
     components.html(html_code, height=460)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -339,10 +395,8 @@ with st.container():
             "candidate": st.session_state['candidates'],
             "probability": st.session_state['probs']
         })
-        # ensure length >= 1
         if dfp['probability'].isnull().any():
             dfp['probability'] = dfp['probability'].fillna(0.0)
-        # show bar chart
         try:
             st.bar_chart(dfp.set_index('candidate')['probability'], width='stretch', height=220)
         except Exception:
