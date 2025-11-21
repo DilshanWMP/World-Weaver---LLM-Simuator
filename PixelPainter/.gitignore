@@ -1,0 +1,11 @@
+sd15/
+steps/
+__pycache__/
+*.pyc
+.DS_Store
+.venv
+venv/
+.env
+*.safetensors
+*.bin
+node_modules/
