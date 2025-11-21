@@ -7,13 +7,15 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "tailwind:watch": "tailwindcss -i ./src/index.css -o ./dist/output.css --watch"
   },
   "dependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
     "axios": "^1.13.2",
+    "framer-motion": "^12.23.24",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "tailwind:watch": "tailwindcss -i ./src/index.css -o ./dist/output.css --watch"
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
