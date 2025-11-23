@@ -1,3 +1,5 @@
+// App.jsx — Improved UI Layout
+
 import { useState } from 'react'
 import PromptStation from './components/PromptStation'
 import EncoderStation from './components/EncoderStation'
@@ -6,6 +8,7 @@ import RefinementStation from './components/RefinementStation'
 import axios from 'axios'
 
 export default function App(){
+
   const [prompt, setPrompt] = useState('')
   const [tokens, setTokens] = useState([])
   const [embeddings, setEmbeddings] = useState(null)
@@ -60,30 +63,31 @@ export default function App(){
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-slate-100 p-8">
-      <div className="max-w-6xl mx-auto grid grid-cols-12 gap-6">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-850 to-slate-900 text-slate-100 p-8">
+
+      <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6">
 
         {/* LEFT SIDEBAR */}
         <div className="col-span-12 lg:col-span-4 space-y-6">
-          
-          <div className="bg-slate-800 p-4 rounded-2xl shadow-lg">
-            <h2 className="text-2xl font-semibold">🖌️ The Pixel Painter</h2>
-            <p className="text-sm text-slate-400 mt-1">
-              Type a prompt and watch how a diffusion model paints it — step by step.
+
+          {/* Title Card */}
+          <div className="bg-slate-800/70 backdrop-blur-sm p-6 rounded-2xl shadow-lg">
+            <h2 className="text-3xl font-bold tracking-tight">🖌️ Pixel Painter</h2>
+            <p className="text-sm text-slate-400 mt-1 leading-relaxed">
+              A step-by-step visual demonstration of how diffusion models generate images.
             </p>
           </div>
 
-          <PromptStation 
-            onSubmit={generate} 
-            loading={loading} 
-          />
+          {/* Prompt */}
+          <PromptStation onSubmit={generate} loading={loading} />
 
-          <div className="bg-slate-800 p-4 rounded-2xl">
-            <h3 className="text-lg font-medium">Status</h3>
+          {/* Status Panel */}
+          <div className="bg-slate-800/70 p-5 rounded-2xl shadow-lg">
+            <h3 className="text-lg font-semibold">Status</h3>
             <p className="text-sm text-slate-400 mt-2">{statusText}</p>
 
-            <div className="mt-3">
-              <h4 className="text-sm text-slate-300">Tokens</h4>
+            <div className="mt-4">
+              <h4 className="text-sm text-slate-300 font-medium">Tokens</h4>
               <div className="flex flex-wrap gap-2 mt-2">
                 {tokens.map((t,i)=> (
                   <div key={i} className="token-pill text-xs">{t}</div>
@@ -92,13 +96,12 @@ export default function App(){
             </div>
           </div>
 
+          {/* Encoder */}
           <EncoderStation tokens={tokens} embeddings={embeddings} />
         </div>
 
-        {/* RIGHT MAIN CONTENT */}
+        {/* RIGHT SIDE */}
         <div className="col-span-12 lg:col-span-8 space-y-6">
-
-          {/* Removed NoiseCanvas */}
 
           <DiffusionViewer 
             frames={frames} 
@@ -112,8 +115,6 @@ export default function App(){
             step={step} 
             ts={ts} 
           />
-
-          {/* Removed FinalCanvas */}
 
         </div>
       </div>
