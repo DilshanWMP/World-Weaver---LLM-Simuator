@@ -5,6 +5,7 @@ import TokenTable from "../components/TokenTable";
 import ProbChart from "../components/ProbChart";
 import Transformer3D from "../components/Transformer3D";
 import SidePanel from "../components/SidePanel";
+import EmbeddingViewer from "../components/EmbeddingViewer";
 
 export default function Home() {
   // main app state
@@ -65,6 +66,9 @@ export default function Home() {
           />
 
           <OutputBox output={output} lastToken={lastToken} />
+          
+          <EmbeddingViewer context={output ? output : context} numTokens={3} />
+
 
           <TokenTable
             tokens={output ? outputTokens(output) : []}

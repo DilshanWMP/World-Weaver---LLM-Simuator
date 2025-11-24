@@ -1,32 +1,30 @@
+# main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from llm_core import compute_next_token
+from llm_core import compute_next_token, get_embeddings
 
 app = FastAPI()
 
-# ---------------------------------------------------
-# CORS FIX — REQUIRED FOR YOUR REACT FRONTEND
-# ---------------------------------------------------
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # or ["http://localhost:5173"] for extra safety
+    allow_origins=["*"],     # or ["http://localhost:5173"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------
-# Request model
-# ---------------------------------------------------
+# Generate request model
 class GenRequest(BaseModel):
     context: str
     temperature: float = 1.0
     top_k: int = 8
 
-# ---------------------------------------------------
-# Routes
-# ---------------------------------------------------
+class EmbRequest(BaseModel):
+    context: str
+    num_tokens: int = 3   # default to last 3 tokens
+
 @app.post("/generate")
 def generate(req: GenRequest):
     result = compute_next_token(
@@ -36,6 +34,14 @@ def generate(req: GenRequest):
     )
     return result
 
+@app.post("/embed")
+def embed(req: EmbRequest):
+    """
+    Returns embeddings for the last `num_tokens` tokens in req.context
+    Response: [ { token, token_id, embedding: [float,...] }, ... ]
+    """
+    embeddings = get_embeddings(req.context, num_tokens=req.num_tokens)
+    return {"embeddings": embeddings}
 
 @app.get("/")
 def root():
