@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+starlette
+Pillow
+torch
+diffusers
+transformers
+accelerate
+safetensors
+numpy
