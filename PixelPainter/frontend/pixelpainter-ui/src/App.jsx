@@ -7,6 +7,7 @@ import RefinementStation from './components/RefinementStation'
 import axios from 'axios'
 
 export default function App(){
+  const [prevSelection, setPrevSelection] = useState(null)
   const [prompt, setPrompt] = useState('')
   const [tokens, setTokens] = useState([])
   const [frames, setFrames] = useState([])
@@ -27,8 +28,10 @@ export default function App(){
     try {
       const res = await axios.post('http://localhost:8000/generate', { prompt: newPrompt })
       const frameFiles = res.data.frames || []
+      const prev = res.data.previous || null
       setTs(Date.now())
       setFrames(frameFiles)
+      setPrevSelection(prev)   // new
       setStatusText('Animating diffusion steps')
       const interval = setInterval(() => {
         setStep(prev => {
@@ -71,7 +74,7 @@ export default function App(){
         {/* Bottom Section: Diffusion Steps (Left) and Refinement (Right) */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <DiffusionViewer frames={frames} step={step} setStep={setStep} ts={ts} />
-          <RefinementStation frames={frames} step={step} ts={ts} />
+          <RefinementStation frames={frames} step={step} ts={ts} prev={prevSelection} />
         </div>
 
       </div>
