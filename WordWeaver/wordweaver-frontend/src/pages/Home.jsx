@@ -1,11 +1,16 @@
+// wordweaver-frontend/src/pages/Home.jsx
+
 import React, { useState } from "react";
 import PromptBox from "../components/PromptBox";
 import OutputBox from "../components/OutputBox";
-import TokenTable from "../components/TokenTable";
+
 import ProbChart from "../components/ProbChart";
 import Transformer3D from "../components/Transformer3D";
 import SidePanel from "../components/SidePanel";
-import EmbeddingViewer from "../components/EmbeddingViewer";
+
+import InternalInspector from "../components/InternalInspector";
+import MLPFlowChart from "../components/MLPFlowChart";
+import LogitsPanel from "../components/LogitsPanel";
 
 export default function Home() {
   // main app state
@@ -15,12 +20,26 @@ export default function Home() {
   const [candidates, setCandidates] = useState([]);
   const [probs, setProbs] = useState([]);
   const [tokenIds, setTokenIds] = useState([]);
+  const [autoRefreshTrigger, setAutoRefreshTrigger] = useState(0);
+
+
+  // internals from inspector (set by InternalInspector via onUpdate)
+  const [internals, setInternals] = useState(null);
 
   // Controls (sidebar-controlled)
   const [modelName, setModelName] = useState("meta-llama/Llama-3.2-3B");
   const [temperature, setTemperature] = useState(0.8);
   const [topK, setTopK] = useState(8);
   const [speed, setSpeed] = useState(0.25);
+
+  function SectionHeader({ title, subtitle }) {
+  return (
+    <div className="mb-2">
+      <div className="text-lg font-semibold text-white">{title}</div>
+      <div className="text-sm text-slate-400">{subtitle}</div>
+    </div>
+  );
+}
 
   return (
     <div className="ml-10 mt-5">
@@ -63,26 +82,55 @@ export default function Home() {
             temperature={temperature}
             topK={topK}
             speed={speed}
+            setAutoRefreshTrigger={setAutoRefreshTrigger}
+
           />
 
           <OutputBox output={output} lastToken={lastToken} />
-          
-          <EmbeddingViewer context={output ? output : context} numTokens={3} />
 
-
-          <TokenTable
-            tokens={output ? outputTokens(output) : []}
-            tokenIds={tokenIds}
+          {/* Internal inspector shows tokens, embeddings, positional vectors, attention & 3D */}
+          <InternalInspector
+            context={output ? output : context}
+            numTokens={9999}
+            autoRefreshTrigger={autoRefreshTrigger}
+            onUpdate={(d) => setInternals(d)}
           />
-        </div>
 
-        {/* Right side: 3D + probabilities */}
+
+        </div>
+        
+
+        {/* Right side: 3D + MLP + logits + probs */}
         <div className="space-y-6">
           <Transformer3D
             tokens={output ? outputTokens(output).slice(-24) : []}
             speed={speed}
           />
 
+          {/* MLP Flow diagram */}
+          <MLPFlowChart />
+
+          {/* Logits panel powered by internals */}
+          <LogitsPanel logits={internals?.logits} temperature={temperature} />
+
+          <div className="p-4 rounded-xl bg-slate-900/70 border border-slate-700">
+          <SectionHeader
+            title="7. Softmax & Token Probabilities"
+            subtitle="Softmax turns logits into probabilities that sum to 1."
+          />
+
+          <p className="text-sm text-slate-300 mb-2">
+            Softmax amplifies differences — the highest logits become the highest probability next-token choices.
+          </p>
+
+          <p className="text-sm text-slate-300">
+            <span className="text-amber-400 font-semibold">Temperature</span> controls randomness:
+            <br/>• Low temperature → focused, predictable  
+            <br/>• High temperature → more creative and chaotic  
+          </p>
+        </div>
+
+          {/* Next-word probabilities */}
           <ProbChart candidates={candidates} probs={probs} />
         </div>
 
@@ -91,7 +139,7 @@ export default function Home() {
   );
 }
 
-// Helper tokenizer fallback
+// Helper tokenizer fallback (same as before)
 function outputTokens(text) {
   if (!text) return [];
   const parts = [];

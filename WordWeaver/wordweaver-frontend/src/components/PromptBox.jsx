@@ -1,3 +1,4 @@
+// src/components/PromptBox.jsx
 import React, { useState } from "react";
 import axios from "axios";
 
@@ -22,7 +23,8 @@ export default function PromptBox({
   modelName,
   temperature,
   topK,
-  speed
+  speed,
+  setAutoRefreshTrigger // <-- new prop accepted
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -61,17 +63,21 @@ export default function PromptBox({
       setCandidates(cands);
       setProbs(probs);
 
-      // token ids: if backend returned token ids in data.token_ids, set them, else attempt local best-effort
+      // token ids: if backend returned token ids in data.token_ids, set them
       if (data.token_ids) {
         setTokenIds(data.token_ids);
       } else {
-        // simple local heuristic: we don't have exact tokenizer, fill with incremental ids
         const guessed = newOutput.split(/\s+/).map((_, i) => i + 1);
         setTokenIds(guessed);
       }
+
+      // ---- IMPORTANT: notify inspector to refresh internals ----
+      if (typeof setAutoRefreshTrigger === "function") {
+        setAutoRefreshTrigger(prev => prev + 1);
+      }
     } catch (err) {
       console.error("generate error", err);
-      // fallback sampling behavior similar to your Streamlit fallback
+      // fallback sampling behavior
       const fallbackPool = ["the", "a", "story", "world", "time", "data", "love", "storm", "new", "city", "this", "that", "an", "model", "people", "night", "light", "voice", "found"];
       const nextToken = " " + fallbackPool[Math.floor(Math.random() * fallbackPool.length)];
       const newOutput = (output && output.length ? output : context) + nextToken;
@@ -81,6 +87,11 @@ export default function PromptBox({
       setProbs([1.0]);
       setTokenIds(newOutput.split(/\s+/).map((_, i) => i + 1));
       setError("Model/Backend error — used fallback token.");
+
+      // ensure inspector still refreshes so UI remains consistent
+      if (typeof setAutoRefreshTrigger === "function") {
+        setAutoRefreshTrigger(prev => prev + 1);
+      }
     } finally {
       setLoading(false);
     }
@@ -94,6 +105,11 @@ export default function PromptBox({
     setProbs([]);
     setTokenIds([]);
     setError("");
+
+    // reset inspector too (optional): trigger a refresh so it clears
+    if (typeof setAutoRefreshTrigger === "function") {
+      setAutoRefreshTrigger(prev => prev + 1);
+    }
   };
 
   return (
@@ -117,6 +133,11 @@ export default function PromptBox({
               setOutput(p);
               // simple tokenization for UI
               setTokenIds(p.split(/\s+/).map((_, i) => i + 1));
+
+              // Immediately trigger inspector to reflect the preset selection
+              if (typeof setAutoRefreshTrigger === "function") {
+                setAutoRefreshTrigger(prev => prev + 1);
+              }
             }}
             className="px-3 py-1 bg-slate-700 rounded-md text-sm hover:bg-slate-600"
           >

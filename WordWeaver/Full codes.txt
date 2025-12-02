@@ -1,0 +1,1480 @@
+===================== Backend ===========================
+
+wordweaver-backend/llm_core.py
+
+# wordweaver-backend/llm_core.py
+import math
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+MODEL_NAME = "meta-llama/Llama-3.2-3B"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+
+bnb = BitsAndBytesConfig(load_in_8bit=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb,
+    device_map="auto",
+    trust_remote_code=True
+)
+
+# ---- existing next-token function ----
+def compute_next_token(context_text, temp=1.0, top_k=10):
+    device = next(model.parameters()).device
+
+    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs["input_ids"].to(device)
+
+    with torch.no_grad():
+        outputs = model(input_ids)
+        logits = outputs.logits[0, -1] / max(temp, 1e-8)
+        probs = torch.softmax(logits, dim=-1)
+
+        # Top-K
+        topk = torch.topk(probs, k=min(top_k, probs.shape[0]))
+        ids = topk.indices.cpu().tolist()
+        vals = topk.values.cpu().tolist()
+        tokens = [tokenizer.decode([i]) for i in ids]
+
+        # Sample one token
+        next_id = torch.multinomial(probs, 1).item()
+        next_token = tokenizer.decode([next_id])
+
+    # Return full IDs so TokenTable shows accurate Token IDs
+    return {
+        "next_token": next_token,
+        "candidates": tokens,
+        "probs": vals,
+        "token_ids": input_ids[0].cpu().tolist()
+    }
+
+# ---- existing get_embeddings (unchanged) ----
+def get_embeddings(context_text: str, num_tokens: int = 3):
+    device = next(model.parameters()).device
+
+    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs["input_ids"].to(device)  # shape (1, seq_len)
+
+    seq = input_ids[0]
+    seq_len = seq.shape[0]
+    if seq_len == 0:
+        return []
+
+    n = max(1, min(num_tokens, seq_len))
+    selected_ids = seq[-n:]  # a tensor of length n
+
+    with torch.no_grad():
+        embed_layer = model.get_input_embeddings()
+        selected_ids = selected_ids.unsqueeze(0)
+        embeddings = embed_layer(selected_ids)
+        embeddings = embeddings[0].cpu()
+
+    result = []
+    for i, tok_id in enumerate(selected_ids[0].cpu().tolist()):
+        token_str = tokenizer.decode([tok_id])
+        emb_vector = embeddings[i].tolist()
+        result.append({
+            "token": token_str,
+            "token_id": tok_id,
+            "embedding": emb_vector
+        })
+    return result
+
+# ---- NEW: internal_forward to expose intermediate values ----
+def internal_forward(context_text: str, num_tokens: int = 3, layer_index: int = -1):
+    """
+    Perform a forward pass and return internals:
+      - selected token embeddings
+      - a positional vector (sinusoidal demo)
+      - averaged attention matrix (last or chosen layer)
+      - Q/K/V projections for selected tokens (if accessible)
+      - FFN/hidden state for last layer (if available)
+      - logits (raw) for the last position
+    """
+
+    device = next(model.parameters()).device
+
+    # Tokenize and prepare
+    inputs = tokenizer(context_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = inputs["input_ids"].to(device)
+    seq_len = input_ids.shape[1] if input_ids is not None else 0
+
+    if seq_len == 0:
+        return {"error": "no tokens in input"}
+
+    # number of tokens to inspect: last `num_tokens`
+    n = max(1, min(num_tokens, seq_len))
+    start_idx = seq_len - n
+    positions = list(range(start_idx, seq_len))
+
+    # Do a forward pass asking model to return attentions and hidden_states
+    with torch.no_grad():
+        try:
+            outputs = model(input_ids, output_attentions=True, output_hidden_states=True)
+        except TypeError:
+            # some wrappers require flags in config instead; try without flags
+            outputs = model(input_ids)
+
+    resp = {}
+    # ---- logits (raw scores) for last position ----
+    try:
+        logits = outputs.logits  # shape [1, seq_len, vocab_size]
+        last_logits = logits[0, -1].cpu().tolist()
+        resp["logits"] = last_logits  # full vocab raw scores (can be big)
+    except Exception:
+        resp["logits"] = None
+
+    # ---- hidden states ----
+    try:
+        # hidden_states is tuple(len = num_layers+1), first is embedding outputs
+        hidden_states = outputs.hidden_states
+        # choose the layer index (negative indexes allowed)
+        chosen_hidden = hidden_states[layer_index]  # shape [1, seq_len, dim]
+        # move to CPU and convert last n token hidden states to list
+        chosen_hidden_cpu = chosen_hidden[0, start_idx:seq_len].cpu().tolist()
+        resp["hidden_states_selected"] = chosen_hidden_cpu
+    except Exception:
+        resp["hidden_states_selected"] = None
+
+    # ---- attentions ----
+    try:
+        # attentions: tuple of (layer) tensors [batch, num_heads, seq_len, seq_len]
+        attentions = outputs.attentions
+        # pick requested layer (last by default)
+        att = attentions[layer_index]  # shape [batch, num_heads, seq_len, seq_len]
+        # average heads to get single matrix [seq_len, seq_len]
+        att_avg = att[0].mean(dim=0).cpu().tolist()
+        # For compactness, only return the last n x n submatrix (selected tokens attending to selected tokens)
+        att_sub = [[row[start_idx:seq_len] for row in att_avg][r][c] for r in range(start_idx, seq_len) for c in range(start_idx, seq_len)]
+        # better shape: create proper submatrix
+        att_matrix = []
+        for r in range(start_idx, seq_len):
+            row_vals = att_avg[r][start_idx:seq_len]
+            att_matrix.append([float(v) for v in row_vals])
+        resp["attention_matrix_selected"] = att_matrix  # n x n
+    except Exception:
+        resp["attention_matrix_selected"] = None
+
+    # ---- embeddings for the last tokens (reuse get_embeddings) ----
+    try:
+        emb_info = get_embeddings(context_text, num_tokens=n)
+        resp["embeddings_selected"] = emb_info
+    except Exception:
+        resp["embeddings_selected"] = None
+
+    # ---- positional vectors (sinusoidal demo) ----
+    try:
+        # produce a small sinusoidal positional vector (same dim as embedding vector if possible)
+        # try to use embedding dim
+        emb_dim = None
+        if resp.get("embeddings_selected") and len(resp["embeddings_selected"]) > 0:
+            emb_dim = len(resp["embeddings_selected"][0]["embedding"])
+        else:
+            # fallback guess
+            emb_dim = 256 if emb_dim is None else emb_dim
+
+        def sinusoidal_position_vector(pos, dim):
+            vec = []
+            for i in range(dim):
+                denom = 10000 ** (2 * (i // 2) / float(dim))
+                if i % 2 == 0:
+                    vec.append(math.sin(pos / denom))
+                else:
+                    vec.append(math.cos(pos / denom))
+            return vec
+
+        pos_vectors = []
+        for p in positions:
+            pos_vectors.append(sinusoidal_position_vector(p, emb_dim))
+        resp["positional_vectors_selected"] = pos_vectors
+    except Exception:
+        resp["positional_vectors_selected"] = None
+
+    # ---- try to compute Q/K/V for selected tokens (best-effort) ----
+    try:
+        qkv = []
+        # try to access layer module for projection weights
+        # different HF wrappers name things differently; try several common paths
+        proj_found = False
+        layer_module = None
+        # common path for LLaMA-like: model.model.layers[layer_index]
+        try:
+            # if user passed negative index, python will handle it
+            layer_module = model.model.layers[layer_index]
+            proj_found = True
+        except Exception:
+            proj_found = False
+
+        if proj_found:
+            # try common attribute names for self-attention projections
+            q_proj = getattr(layer_module.self_attn, "q_proj", None)
+            k_proj = getattr(layer_module.self_attn, "k_proj", None)
+            v_proj = getattr(layer_module.self_attn, "v_proj", None)
+            # fallback: some models name them q_proj, k_proj, v_proj directly under layer_module
+            if q_proj is None:
+                q_proj = getattr(layer_module, "q_proj", None)
+                k_proj = getattr(layer_module, "k_proj", None)
+                v_proj = getattr(layer_module, "v_proj", None)
+
+            if q_proj is not None and k_proj is not None and v_proj is not None:
+                # use chosen_hidden (the input to that layer) if present, else use embeddings
+                src_hidden = None
+                try:
+                    src_hidden = hidden_states[layer_index][0, start_idx:seq_len]  # shape [n, dim]
+                except Exception:
+                    src_hidden = None
+                if src_hidden is None:
+                    # fallback to input embeddings of selected tokens
+                    src_hidden = torch.tensor([e["embedding"] for e in resp.get("embeddings_selected", [])])
+                # compute q/k/v = src_hidden @ W.T (+ bias if present)
+                q_w = getattr(q_proj, "weight", None)
+                q_b = getattr(q_proj, "bias", None)
+                k_w = getattr(k_proj, "weight", None)
+                k_b = getattr(k_proj, "bias", None)
+                v_w = getattr(v_proj, "weight", None)
+                v_b = getattr(v_proj, "bias", None)
+
+                if q_w is not None:
+                    q_vecs = (src_hidden.to(q_w.device) @ q_w.t().to(src_hidden.device)).cpu().tolist()
+                    if q_b is not None:
+                        # add bias (roughly)
+                        qb = q_b.cpu().tolist()
+                        q_vecs = [[qv + qb_i for qv, qb_i in zip(vec, qb[:len(vec)])] for vec in q_vecs]
+                else:
+                    q_vecs = None
+
+                if k_w is not None:
+                    k_vecs = (src_hidden.to(k_w.device) @ k_w.t().to(src_hidden.device)).cpu().tolist()
+                    if k_b is not None:
+                        kb = k_b.cpu().tolist()
+                        k_vecs = [[kv + kb_i for kv, kb_i in zip(vec, kb[:len(vec)])] for vec in k_vecs]
+                else:
+                    k_vecs = None
+
+                if v_w is not None:
+                    v_vecs = (src_hidden.to(v_w.device) @ v_w.t().to(src_hidden.device)).cpu().tolist()
+                    if v_b is not None:
+                        vb = v_b.cpu().tolist()
+                        v_vecs = [[vv + vb_i for vv, vb_i in zip(vec, vb[:len(vec)])] for vec in v_vecs]
+                else:
+                    v_vecs = None
+
+                resp["q_vectors_selected"] = q_vecs
+                resp["k_vectors_selected"] = k_vecs
+                resp["v_vectors_selected"] = v_vecs
+            else:
+                resp["q_vectors_selected"] = None
+                resp["k_vectors_selected"] = None
+                resp["v_vectors_selected"] = None
+        else:
+            resp["q_vectors_selected"] = None
+            resp["k_vectors_selected"] = None
+            resp["v_vectors_selected"] = None
+    except Exception:
+        resp["q_vectors_selected"] = None
+        resp["k_vectors_selected"] = None
+        resp["v_vectors_selected"] = None
+
+    # ---- return the last n token strings for convenience ----
+    try:
+        token_list = [tokenizer.decode([int(x)]) for x in input_ids[0, start_idx:seq_len].cpu().tolist()]
+        resp["tokens_selected"] = token_list
+    except Exception:
+        resp["tokens_selected"] = None
+
+    return resp
+
+
+
+
+wordweaver-backend/main.py
+
+# wordweaver-backend/main.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from llm_core import compute_next_token, get_embeddings, internal_forward
+
+app = FastAPI()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],     # or ["http://localhost:5173"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Generate request model
+class GenRequest(BaseModel):
+    context: str
+    temperature: float = 1.0
+    top_k: int = 8
+
+class EmbRequest(BaseModel):
+    context: str
+    num_tokens: int = 3   # default to last 3 tokens
+
+class InternalRequest(BaseModel):
+    context: str
+    num_tokens: int = 3
+    layer_index: int = -1
+
+@app.post("/generate")
+def generate(req: GenRequest):
+    result = compute_next_token(
+        context_text=req.context,
+        temp=req.temperature,
+        top_k=req.top_k
+    )
+    return result
+
+@app.post("/embed")
+def embed(req: EmbRequest):
+    embeddings = get_embeddings(req.context, num_tokens=req.num_tokens)
+    return {"embeddings": embeddings}
+
+@app.post("/internal_forward")
+def internal(req: InternalRequest):
+    """
+    Returns internal tensors for the last `num_tokens` tokens. Best-effort fields:
+      tokens_selected
+      embeddings_selected
+      positional_vectors_selected
+      q_vectors_selected, k_vectors_selected, v_vectors_selected
+      attention_matrix_selected (n x n)
+      hidden_states_selected (n x dim)
+      logits (raw for last position)
+    """
+    data = internal_forward(req.context, num_tokens=req.num_tokens, layer_index=req.layer_index)
+    return data
+
+@app.get("/")
+def root():
+    return {"status": "WordWeaver FastAPI backend running"}
+
+
+wordweaver-backend/requirements.txt
+
+fastapi
+uvicorn
+transformers
+torch
+bitsandbytes
+accelerate
+
+
+====================== Frontend ==============================
+
+wordweaver-frontend/package.json
+
+{
+  "name": "wordweaver-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "@xenova/transformers": "^2.17.2",
+    "axios": "^1.13.2",
+    "lucide-react": "^0.554.0",
+    "ml-pca": "^4.1.1",
+    "plotly.js": "^3.3.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-plotly.js": "^2.6.0",
+    "three": "^0.181.2",
+    "umap-js": "^1.4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "autoprefixer": "^10.4.22",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.17",
+    "vite": "^7.2.4"
+  }
+}
+
+
+
+wordweaver-frontend/src/App.jsx
+
+import React from "react";
+import Home from "./pages/Home";
+
+export default function App() {
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100">
+      <Home />
+    </div>
+  );
+}
+
+
+wordweaver-frontend/src/index.css
+
+@import "tailwindcss";
+
+/* small UI tweaks to match your streamlit look */
+:root {
+  --card-bg: #0b1220; /* dark card */
+}
+body {
+  background: linear-gradient(90deg,#071022,#071018 60%);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+.card {
+  background: #0b1220;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 8px 30px rgba(2,6,23,0.6);
+}
+
+wordweaver-frontend/src/main.jsx
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+wordweaver-frontend/src/pages/Home.jsx
+
+import React, { useState } from "react";
+import PromptBox from "../components/PromptBox";
+import OutputBox from "../components/OutputBox";
+
+import ProbChart from "../components/ProbChart";
+import Transformer3D from "../components/Transformer3D";
+import SidePanel from "../components/SidePanel";
+
+import InternalInspector from "../components/InternalInspector";
+
+
+
+export default function Home() {
+  // main app state
+  const [context, setContext] = useState("");
+  const [output, setOutput] = useState("");
+  const [lastToken, setLastToken] = useState("");
+  const [candidates, setCandidates] = useState([]);
+  const [probs, setProbs] = useState([]);
+  const [tokenIds, setTokenIds] = useState([]);
+
+  // Controls (sidebar-controlled)
+  const [modelName, setModelName] = useState("meta-llama/Llama-3.2-3B");
+  const [temperature, setTemperature] = useState(0.8);
+  const [topK, setTopK] = useState(8);
+  const [speed, setSpeed] = useState(0.25);
+
+  return (
+    <div className="ml-10 mt-5">
+      {/* Top navbar */}
+      <div className="fixed top-0 left-0 right-0 z-50 h-20 flex items-center px-6 bg-gradient-to-r from-slate-900 to-slate-950 text-sky-100 shadow-lg">
+        <div className="text-4xl font-semibold flex items-center gap-3 ml-10 mt-5">
+          <span>🧵</span> <span>Word Weaver - LLM Simulator</span>
+        </div>
+        <div className="flex-1" />
+        <div className="text-sm text-slate-300">Offline demo</div>
+      </div>
+
+      {/* Sidebar (floating UI) */}
+      <SidePanel
+        modelName={modelName}
+        setModelName={setModelName}
+        temperature={temperature}
+        setTemperature={setTemperature}
+        topK={topK}
+        setTopK={setTopK}
+        speed={speed}
+        setSpeed={setSpeed}
+      />
+
+      {/* Main content grid */}
+      <div className="pt-20 px-6 pb-12 grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        {/* Left side: input + output + tokens */}
+        <div className="lg:col-span-2 space-y-6">
+          <PromptBox
+            context={context}
+            setContext={setContext}
+            output={output}
+            setOutput={setOutput}
+            setLastToken={setLastToken}
+            setCandidates={setCandidates}
+            setProbs={setProbs}
+            setTokenIds={setTokenIds}
+            modelName={modelName}
+            temperature={temperature}
+            topK={topK}
+            speed={speed}
+          />
+
+          <OutputBox output={output} lastToken={lastToken} />
+          
+          
+
+          
+
+          {/* Internal inspector shows positional, qkv, attention, logits */}
+          <InternalInspector context={output ? output : context} numTokens={20} layerIndex={-1} />
+
+          
+          
+
+        </div>
+
+        {/* Right side: 3D + probabilities */}
+        <div className="space-y-6">
+          <Transformer3D
+            tokens={output ? outputTokens(output).slice(-24) : []}
+            speed={speed}
+          />
+
+          <ProbChart candidates={candidates} probs={probs} />
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+// Helper tokenizer fallback
+function outputTokens(text) {
+  if (!text) return [];
+  const parts = [];
+  let token = "";
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    token += ch;
+    if (ch === " " || i === text.length - 1) {
+      parts.push(token);
+      token = "";
+    }
+  }
+  if (token) parts.push(token);
+  return parts.length ? parts : [text];
+}
+
+
+
+
+wordweaver-frontend/src/components/Embedding3DViewer.jsx
+
+import React, { useMemo } from "react";
+import Plot from "react-plotly.js";
+import { PCA } from "ml-pca";
+
+function normalize(vec) {
+  const norm = Math.sqrt(vec.reduce((s, x) => s + x * x, 0)) || 1;
+  return vec.map(x => x / norm);
+}
+
+function getAxisLines() {
+  return [
+    {
+      type: "scatter3d",
+      mode: "lines",
+      x: [-1, 1], y: [0, 0], z: [0, 0],
+      line: { width: 4, color: "red" },
+      name: "X",
+      hoverinfo: "skip"
+    },
+    {
+      type: "scatter3d",
+      mode: "lines",
+      x: [0, 0], y: [-1, 1], z: [0, 0],
+      line: { width: 4, color: "green" },
+      name: "Y",
+      hoverinfo: "skip"
+    },
+    {
+      type: "scatter3d",
+      mode: "lines",
+      x: [0, 0], y: [0, 0], z: [-1, 1],
+      line: { width: 4, color: "blue" },
+      name: "Z",
+      hoverinfo: "skip"
+    }
+  ];
+}
+
+export default function Embedding3DViewer({ embeddings }) {
+  const plotData = useMemo(() => {
+    if (!embeddings || embeddings.length === 0) return null;
+
+    const tokens = embeddings.map(e => `${e.token} (${e.token_id})`);
+    const vectors = embeddings.map(e => normalize(e.embedding));
+
+    // PCA → deterministic + stable for small sample sizes
+    const pca = new PCA(vectors);
+    const transformed = pca.predict(vectors, { nComponents: 3 }).to2DArray();
+
+    const px = transformed.map(v => v[0]);
+    const py = transformed.map(v => v[1]);
+    const pz = transformed.map(v => v[2]);
+
+    // Points
+    const points = {
+      type: "scatter3d",
+      mode: "markers+text",
+      x: px,
+      y: py,
+      z: pz,
+      text: tokens,
+      textposition: "top center",
+      marker: { size: 6, color: "#FFD700" },  // bright yellow
+      name: "Embeddings"
+    };
+
+    // Arrows
+    const arrows = transformed.map((v, i) => ({
+      type: "scatter3d",
+      mode: "lines",
+      x: [0, v[0]],
+      y: [0, v[1]],
+      z: [0, v[2]],
+      line: { width: 4, color: "white" },
+      name: "",
+      hoverinfo: "text",
+      text: tokens[i]
+    }));
+
+    return [points, ...arrows, ...getAxisLines()];
+  }, [embeddings]);
+
+  if (!plotData) return <div className="text-slate-400">Generate tokens to see embeddings</div>;
+
+  return (
+    <div className="mt-6">
+      <h2 className="text-slate-300 text-sm mb-1">3D Embedding Space</h2>
+      <Plot
+        data={plotData}
+        layout={{
+          width: 720,
+          height: 520,
+          paper_bgcolor: "rgba(0,0,0,0)",
+          scene: {
+            aspectmode: "cube",
+            xaxis: { title: "PC1" },
+            yaxis: { title: "PC2" },
+            zaxis: { title: "PC3" }
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+
+
+wordweaver-frontend/src/components/OutputBox.jsx
+
+import React from "react";
+
+export default function OutputBox({ output, lastToken }) {
+  return (
+    <div className="card">
+      <div className="mb-2 text-slate-300">Output (built token-by-token)</div>
+      <div className="mb-4 text-center text-6xl font-extrabold text-emerald-400 leading-tight">{lastToken}</div>
+      <div className="bg-slate-800 p-4 rounded-md min-h-[100px] whitespace-pre-wrap text-slate-100 text-4xl font-bold">
+        {output || "No output yet."}
+      </div>
+    </div>
+  );
+}
+
+
+
+
+wordweaver-frontend/src/components/ProbChart.jsx
+
+import React from "react";
+
+export default function ProbChart({ candidates = [], probs = [] }) {
+  const safeProbs = probs || [];
+
+  const normalized = (() => {
+    const s = safeProbs.reduce((a, b) => a + (b || 0), 0) || 1;
+    return safeProbs.map((p) => (p || 0) / s);
+  })();
+
+  return (
+    <div className="card">
+      <div className="mb-3 text-slate-300"><strong>Next-word Probabilities</strong></div>
+
+      {candidates.length ? (
+        <>
+          <div className="space-y-3">
+            {candidates.map((c, i) => (
+              <div key={i} className="flex items-center gap-3">
+                <div className="w-28 text-sm truncate">{c}</div>
+                <div className="flex-1 bg-slate-800 h-3 rounded-full overflow-hidden">
+                  <div style={{ width: `${(normalized[i] || 0) * 100}%` }} className="h-3 bg-sky-500 rounded-full"></div>
+                </div>
+                <div className="w-16 text-right text-sm">{((normalized[i] || 0) * 100).toFixed(2)}%</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 overflow-auto max-h-40">
+            <table className="w-full text-sm">
+              <thead className="text-slate-400">
+                <tr>
+                  <th className="py-2 text-left">Candidate</th>
+                  <th className="py-2 text-left">Probability</th>
+                </tr>
+              </thead>
+              <tbody>
+                {candidates.map((c, i) => (
+                  <tr key={i} className="border-t border-slate-800">
+                    <td className="py-2">{c}</td>
+                    <td className="py-2">{(normalized[i] || 0).toFixed(3)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <div className="text-slate-400">Generate a token to see probabilities.</div>
+      )}
+    </div>
+  );
+}
+
+
+
+wordweaver-frontend/src/components/PromptBox.jsx
+
+import React, { useState } from "react";
+import axios from "axios";
+
+const presets = [
+  "Once upon a time",
+  "The quick brown fox",
+  "In a world where",
+  "I love programming because",
+  "During the storm, the",
+  "Researchers discovered a new"
+];
+
+export default function PromptBox({
+  context,
+  setContext,
+  output,
+  setOutput,
+  setLastToken,
+  setCandidates,
+  setProbs,
+  setTokenIds,
+  modelName,
+  temperature,
+  topK,
+  speed
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const generateNext = async () => {
+    setError("");
+    const ctx = output && output.length ? output : context;
+    if (!ctx || !ctx.trim()) {
+      setError("Please type a prompt or choose a preset before generating.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await axios.post("http://localhost:8000/generate", {
+        context: ctx,
+        temperature: temperature,
+        top_k: topK
+      }, { timeout: 120000 });
+
+      const data = res.data;
+      const nextToken = data.next_token ?? "";
+      const cands = data.candidates ?? [];
+      const probs = data.probs ?? [];
+
+      // spacing heuristics like streamlit
+      let newOutput = output && output.length ? output : context;
+      if (nextToken.startsWith(" ")) {
+        newOutput = newOutput + nextToken;
+      } else {
+        newOutput = (newOutput + " " + nextToken).trim();
+      }
+
+      setOutput(newOutput);
+      setLastToken(nextToken);
+      setCandidates(cands);
+      setProbs(probs);
+
+      // token ids: if backend returned token ids in data.token_ids, set them, else attempt local best-effort
+      if (data.token_ids) {
+        setTokenIds(data.token_ids);
+      } else {
+        // simple local heuristic: we don't have exact tokenizer, fill with incremental ids
+        const guessed = newOutput.split(/\s+/).map((_, i) => i + 1);
+        setTokenIds(guessed);
+      }
+    } catch (err) {
+      console.error("generate error", err);
+      // fallback sampling behavior similar to your Streamlit fallback
+      const fallbackPool = ["the", "a", "story", "world", "time", "data", "love", "storm", "new", "city", "this", "that", "an", "model", "people", "night", "light", "voice", "found"];
+      const nextToken = " " + fallbackPool[Math.floor(Math.random() * fallbackPool.length)];
+      const newOutput = (output && output.length ? output : context) + nextToken;
+      setOutput(newOutput);
+      setLastToken(nextToken);
+      setCandidates([nextToken]);
+      setProbs([1.0]);
+      setTokenIds(newOutput.split(/\s+/).map((_, i) => i + 1));
+      setError("Model/Backend error — used fallback token.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const doReset = () => {
+    setContext("");
+    setOutput("");
+    setLastToken("");
+    setCandidates([]);
+    setProbs([]);
+    setTokenIds([]);
+    setError("");
+  };
+
+  return (
+    <div className="card">
+      <div className="mb-3 text-slate-300">Input Prompt — type your prompt or choose a preset.</div>
+
+      <textarea
+        rows={4}
+        value={context}
+        onChange={(e) => setContext(e.target.value)}
+        placeholder="Type prompt..."
+        className="w-full p-3 bg-slate-800 rounded-md text-slate-100"
+      />
+
+      <div className="mt-3 flex gap-2 flex-wrap">
+        {presets.map((p) => (
+          <button
+            key={p}
+            onClick={() => {
+              setContext(p);
+              setOutput(p);
+              // simple tokenization for UI
+              setTokenIds(p.split(/\s+/).map((_, i) => i + 1));
+            }}
+            className="px-3 py-1 bg-slate-700 rounded-md text-sm hover:bg-slate-600"
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <button onClick={generateNext} disabled={loading} className="px-4 py-2 bg-emerald-600 rounded-md hover:bg-emerald-500">
+          {loading ? "Generating..." : "Generate Next Token"}
+        </button>
+        <button onClick={doReset} className="px-4 py-2 bg-rose-600 rounded-md hover:bg-rose-500">Reset</button>
+      </div>
+
+      {error && <div className="mt-2 text-sm text-rose-300">{error}</div>}
+    </div>
+  );
+}
+
+
+
+wordweaver-frontend/src/components/SidePanel.jsx
+
+import { useState } from "react";
+import { Sliders, X } from "lucide-react";   // Icon library (already in Vite template via lucide-react)
+
+export default function SidePanel({
+  modelName, setModelName,
+  temperature, setTemperature,
+  topK, setTopK,
+  speed, setSpeed
+}) {
+
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      {/* Toggle button */}
+      <button
+        onClick={() => setOpen(true)}
+        className="fixed top-8 left-4 z-50 bg-sky-600 hover:bg-sky-500 text-white p-3 rounded-2xl shadow-lg"
+      >
+        <Sliders size={20} />
+      </button>
+
+      {/* Overlay */}
+      {open && (
+        <div
+          onClick={() => setOpen(false)}
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40"
+        />
+      )}
+
+      {/* Sidebar */}
+      <div
+        className={`fixed top-0 left-0 h-full w-72 bg-slate-900 shadow-2xl z-50 transform transition-transform duration-300
+          ${open ? "translate-x-0" : "-translate-x-full"}`}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-slate-700">
+          <h2 className="text-lg font-semibold text-slate-100">Controls</h2>
+          <button
+            onClick={() => setOpen(false)}
+            className="text-slate-300 hover:text-slate-100"
+          >
+            <X size={22} />
+          </button>
+        </div>
+
+        {/* CONTENT */}
+        <div className="p-4 space-y-6">
+
+          {/* Model Selector */}
+          <div>
+            <label className="block text-sm text-slate-400">Model</label>
+            <select
+              value={modelName}
+              onChange={(e) => setModelName(e.target.value)}
+              className="w-full mt-1 p-2 bg-slate-800 rounded-md text-slate-100"
+            >
+              <option>meta-llama/Llama-3.2-3B</option>
+            </select>
+          </div>
+
+          {/* Temperature */}
+          <div>
+            <label className="block text-sm text-slate-400">
+              Temperature: {temperature}
+            </label>
+            <input
+              type="range"
+              min="0.1"
+              max="1.5"
+              step="0.05"
+              value={temperature}
+              onChange={(e) => setTemperature(parseFloat(e.target.value))}
+              className="w-full"
+            />
+          </div>
+
+          {/* Top-k */}
+          <div>
+            <label className="block text-sm text-slate-400">
+              Top-k: {topK}
+            </label>
+            <input
+              type="range"
+              min="1"
+              max="20"
+              step="1"
+              value={topK}
+              onChange={(e) => setTopK(parseInt(e.target.value))}
+              className="w-full"
+            />
+          </div>
+
+          {/* Animation Speed */}
+          <div>
+            <label className="block text-sm text-slate-400">
+              Animation Speed: {speed}
+            </label>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={speed}
+              onChange={(e) => setSpeed(parseFloat(e.target.value))}
+              className="w-full"
+            />
+          </div>
+
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+
+
+wordweaver-frontend/src/components/Transformer3D.jsx
+
+import React, { useEffect, useRef } from "react";
+import * as THREE from "three";
+
+/*
+  This component reproduces the same three.js sprite flow you had in app.py
+  tokens: array of token strings
+  speed: animation speed (0.0 fastest) — maps to sprite Z increment.
+*/
+
+export default function Transformer3D({ tokens = [], speed = 0.25 }) {
+  const containerRef = useRef();
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const width = container.clientWidth || 900;
+    const height = 380;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(width, height);
+    container.innerHTML = "";
+    container.appendChild(renderer.domElement);
+    camera.position.z = 50;
+
+    const layers = 6;
+    const sprites = [];
+
+    function makeSprite(text) {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      const size = 256;
+      canvas.width = size;
+      canvas.height = size;
+      ctx.clearRect(0, 0, size, size);
+      ctx.font = "bold 36px Arial";
+      ctx.fillStyle = "#0b2";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text || "", size / 2, size / 2);
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture });
+      return new THREE.Sprite(material);
+    }
+
+    for (let i = 0; i < tokens.length; i++) {
+      const sp = makeSprite(tokens[i] || "");
+      const layer = i % layers;
+      sp.position.x = (Math.random() - 0.5) * 40;
+      sp.position.y = (Math.random() - 0.5) * 18;
+      sp.position.z = -layer * 10 - Math.random() * 4;
+      sp.scale.set(6, 6, 1);
+      scene.add(sp);
+      sprites.push(sp);
+    }
+
+    let rafId;
+    const speedFactor = Math.max(0.01, 0.12 * Math.max(0, (1 - speed))); // map slider to speed
+    function animate() {
+      rafId = requestAnimationFrame(animate);
+      for (let i = 0; i < sprites.length; i++) {
+        const s = sprites[i];
+        s.position.z += 0.08 + speedFactor;
+        s.rotation.z += 0.001;
+        if (s.position.z > 30) s.position.z = -layers * 10 - Math.random() * 6;
+      }
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    function onResize() {
+      const w = container.clientWidth;
+      renderer.setSize(w, height);
+      camera.aspect = w / height;
+      camera.updateProjectionMatrix();
+    }
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", onResize);
+      renderer.dispose();
+      // remove children and textures
+      sprites.forEach((s) => {
+        if (s.material && s.material.map) s.material.map.dispose();
+        if (s.material) s.material.dispose();
+        scene.remove(s);
+      });
+    };
+  }, [tokens, speed]);
+
+  return (
+    <div className="card">
+      <div className="mb-2 text-slate-300">Transformer layers — visual simulation</div>
+      <div ref={containerRef} style={{ width: "100%", height: 420, borderRadius: 8, overflow: "hidden", background: "#f8fafc" }} />
+    </div>
+  );
+}
+
+
+
+
+wordweaver-frontend/src/components/InternalInspector.jsx
+
+// src/components/InternalInspector.jsx
+import React, { useState } from "react";
+import axios from "axios";
+import Embedding3DViewer from "./Embedding3DViewer";
+
+/*
+  InternalInspector:
+  - POST /internal_forward { context, num_tokens, layer_index }
+  - Displays:
+      - tokens_selected
+      - embeddings_selected (first few dims & heatmap)
+      - positional_vectors_selected (heatmap)
+      - q/k/v vectors (first dims)
+      - attention_matrix_selected (n x n heatmap)
+      - hidden_states_selected (first dims)
+      - logits (top sample)
+*/
+
+function shortVals(arr, show = 8) {
+  if (!arr) return "";
+  if (arr.length <= show) return arr.map((v) => Number(v).toFixed(6)).join(", ");
+  const first = arr.slice(0, show).map((v) => Number(v).toFixed(6)).join(", ");
+  return `${first}, ...`;
+}
+
+function HeatmapRow({ values = [], height = 26 }) {
+  if (!values || values.length === 0) return <div className="text-slate-400">No data</div>;
+  const minV = Math.min(...values);
+  const maxV = Math.max(...values);
+  const range = maxV - minV || 1;
+  return (
+    <div style={{ display: "grid", gridAutoFlow: "column", gridAutoColumns: "minmax(10px, 1fr)" }} className="gap-1">
+      {values.map((v, i) => {
+        const norm = (v - minV) / range;
+        const hue = 220 - Math.round(norm * 200);
+        const bg = `hsl(${hue}deg 80% ${Math.round(55 - norm * 30)}%)`;
+        return <div key={i} title={Number(v).toFixed(6)} style={{ background: bg, height, minWidth: 8 }} />;
+      })}
+    </div>
+  );
+}
+
+export default function InternalInspector({ context, numTokens = 3, layerIndex = -1 }) {
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  const fetchInternals = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await axios.post("http://localhost:8000/internal_forward", {
+        context,
+        num_tokens: numTokens,
+        layer_index: layerIndex
+      }, { timeout: 120000 });
+      setData(res.data);
+    } catch (err) {
+      console.error("internal fetch error", err);
+      setError("Failed to fetch internals from backend.");
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-slate-300 font-semibold">Internal Inspector</div>
+        <div className="text-sm text-slate-400">last {numTokens} tokens - layer {layerIndex}</div>
+      </div>
+
+      <div className="mb-3 flex gap-2">
+        <button onClick={fetchInternals} disabled={!context || loading} className="px-3 py-1 bg-sky-600 rounded-md hover:bg-sky-500">
+          {loading ? "Inspecting..." : "Inspect Internals"}
+        </button>
+        <button onClick={() => { setData(null); setError(null); }} className="px-3 py-1 bg-slate-700 rounded-md hover:bg-slate-600">Clear</button>
+      </div>
+
+      {error && <div className="text-rose-400 mb-2">{error}</div>}
+
+      {!data ? (
+        <div className="text-slate-400">Click "Inspect Internals" after generating tokens to see transformer internals.</div>
+      ) : (
+        <div className="space-y-4">
+          {/* tokens */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Tokens selected</div>
+            <div className="flex gap-2 flex-wrap">
+              {(data.tokens_selected || []).map((t, i) => (
+                <div key={i} className="px-2 py-1 bg-slate-800 rounded text-sm">
+                  {t}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* embeddings */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Embeddings (first dims shown) & heatmaps</div>
+            <div className="space-y-2">
+              {(data.embeddings_selected || []).map((obj, i) => (
+                <div key={i}>
+                  <div className="text-xs text-slate-400 mb-1">Token: <span className="text-white font-medium">{obj.token}</span> &nbsp; id:{obj.token_id}</div>
+                  <div className="text-xs text-slate-400 mb-1">Values: {shortVals(obj.embedding, 8)}</div>
+                  <HeatmapRow values={obj.embedding.slice(0, 48)} height={18} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+        {/* 3D viewer */}
+{data.embeddings_selected && data.embeddings_selected.length > 0 && (
+  <Embedding3DViewer
+      embeddings={data.embeddings_selected}
+      normalizeEmbeddings={false}
+  />
+)}
+
+          {/* positional */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Positional vectors (sinusoidal demo)</div>
+            <div className="space-y-1">
+              {(data.positional_vectors_selected || []).map((pv, i) => (
+                <div key={i}>
+                  <div className="text-xs text-slate-400 mb-1">pos idx: {i}</div>
+                  <HeatmapRow values={pv ? pv.slice(0, 48) : []} height={12} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Q/K/V */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Q / K / V (first dims) — best-effort</div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <div className="text-xs text-slate-400 mb-1">Q vectors</div>
+                {(data.q_vectors_selected || []).slice(0, numTokens).map((vec, i) => (
+                  <div key={i} className="mb-2">
+                    <div className="text-xs text-slate-300">token {i}:</div>
+                    <div className="text-xs text-slate-400"> {shortVals(vec, 12)}</div>
+                  </div>
+                ))}
+                {!data.q_vectors_selected && <div className="text-xs text-slate-500">Q not available for this model wrapper</div>}
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-400 mb-1">K vectors</div>
+                {(data.k_vectors_selected || []).slice(0, numTokens).map((vec, i) => (
+                  <div key={i} className="mb-2">
+                    <div className="text-xs text-slate-300">token {i}:</div>
+                    <div className="text-xs text-slate-400"> {shortVals(vec, 12)}</div>
+                  </div>
+                ))}
+                {!data.k_vectors_selected && <div className="text-xs text-slate-500">K not available for this model wrapper</div>}
+              </div>
+
+              <div>
+                <div className="text-xs text-slate-400 mb-1">V vectors</div>
+                {(data.v_vectors_selected || []).slice(0, numTokens).map((vec, i) => (
+                  <div key={i} className="mb-2">
+                    <div className="text-xs text-slate-300">token {i}:</div>
+                    <div className="text-xs text-slate-400"> {shortVals(vec, 12)}</div>
+                  </div>
+                ))}
+                {!data.v_vectors_selected && <div className="text-xs text-slate-500">V not available for this model wrapper</div>}
+              </div>
+            </div>
+          </div>
+
+          {/* attention matrix */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Attention matrix (averaged heads) — selected tokens</div>
+            {data.attention_matrix_selected ? (
+              <div className="overflow-auto">
+                <table className="table-auto text-xs">
+                  <tbody>
+                    {data.attention_matrix_selected.map((row, ri) => (
+                      <tr key={ri}>
+                        {row.map((cell, ci) => {
+                          const v = Number(cell);
+                          const bg = `rgba(59,130,246, ${0.15 + Math.max(0, Math.min(0.85, v))})`;
+                          return <td key={ci} style={{ background: bg, padding: 4, minWidth: 28, textAlign: 'center' }}>{v.toFixed(2)}</td>;
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500">Attention not available from this model wrapper.</div>
+            )}
+          </div>
+
+          {/* logits preview */}
+          <div>
+            <div className="text-slate-300 text-sm mb-1">Logits (raw scores) preview — top 10 by value</div>
+            {data.logits ? (
+              (() => {
+                const logits = data.logits;
+                // convert to array of {id, score}, pick top10
+                const pairs = logits.map((s, idx) => ({ id: idx, score: Number(s) }));
+                pairs.sort((a, b) => b.score - a.score);
+                const top = pairs.slice(0, 10);
+                return (
+                  <div className="text-xs">
+                    <table className="w-full text-xs">
+                      <thead className="text-slate-400">
+                        <tr><th>ID</th><th>Token</th><th>Score</th></tr>
+                      </thead>
+                      <tbody>
+                        {top.map((p) => (
+                          <tr key={p.id} className="border-t border-slate-800">
+                            <td className="py-1">{p.id}</td>
+                            <td className="py-1">{/* decode id to token string */}
+                              {typeof window !== "undefined" ? "" : ""}{/* placeholder */}
+                              {/* We will decode client-side if needed by calling backend /embed for ids; keep blank here */}
+                            </td>
+                            <td className="py-1">{p.score.toFixed(4)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div className="text-xs text-slate-400 mt-1">Note: logits are raw scores. Softmax -7 probabilities shown in Probability pane.</div>
+                  </div>
+                );
+              })()
+            ) : (
+              <div className="text-xs text-slate-500">No logits available.</div>
+            )}
+          </div>
+        </div>
+        
+      )}
+    </div>
+  );
+}
+
+
+wordweaver-frontend/src/components/MLPFlowChart.jsx
+
+import React from "react";
+import { motion } from "framer-motion";
+
+export default function MLPFlowChart() {
+  const box = "rounded-xl shadow-lg px-4 py-3 bg-slate-800/60 backdrop-blur border border-slate-700";
+  const arrow = (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4 }}
+      className="text-center text-slate-400 text-xl"
+    >
+      ↓
+    </motion.div>
+  );
+
+  return (
+    <div className="w-full mt-10 mb-10">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.97 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ duration: 0.6 }}
+        className="max-w-3xl mx-auto p-6 rounded-2xl bg-slate-900/50 shadow-2xl border border-slate-800"
+      >
+        <h2 className="text-center text-2xl font-semibold text-sky-300 mb-6">
+          🔬 Token Transformation Inside the MLP Layer
+        </h2>
+
+        {/* Hidden State Input */}
+        <motion.div initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} className={box}>
+          <h3 className="text-lg font-semibold text-sky-200">Hidden State (4096 dims)</h3>
+          <p className="text-slate-400 text-sm">
+            The token’s current meaning — encoded as a large vector.
+          </p>
+        </motion.div>
+
+        {arrow}
+
+        {/* Expand */}
+        <motion.div initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} className={box}>
+          <h3 className="text-lg font-semibold text-teal-300">① Expand Layer (W1)</h3>
+          <p className="text-slate-400 text-sm">
+            Vector is expanded to a larger space (~14,000 dims).  
+            This lets the model explore many possible meanings.
+          </p>
+        </motion.div>
+
+        {arrow}
+
+        {/* GELU */}
+        <motion.div initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} className={box}>
+          <h3 className="text-lg font-semibold text-purple-300">② GELU Activation</h3>
+          <p className="text-slate-400 text-sm">
+            Non-linear filtering that keeps useful features  
+            and discards noise. Adds reasoning & abstraction.
+          </p>
+        </motion.div>
+
+        {arrow}
+
+        {/* Shrink */}
+        <motion.div initial={{ x: 20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} className={box}>
+          <h3 className="text-lg font-semibold text-orange-300">③ Shrink Layer (W2)</h3>
+          <p className="text-slate-400 text-sm">
+            Compresses the vector back to model size (4096 dims)  
+            — now refined and semantically richer.
+          </p>
+        </motion.div>
+
+        {arrow}
+
+        {/* Output */}
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className={box}>
+          <h3 className="text-lg font-semibold text-green-300">New Hidden State</h3>
+          <p className="text-slate-400 text-sm">
+            Final refined meaning passed to the next transformer block  
+            & used to predict the next token.
+          </p>
+        </motion.div>
+
+        {/* Summary */}
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="mt-6 p-4 bg-slate-800/40 border border-slate-700 rounded-xl"
+        >
+          <h3 className="text-center font-semibold text-sky-300">🧠 Why the MLP Matters</h3>
+          <p className="text-slate-300 text-sm mt-2 text-center">
+            If attention decides <span className="text-sky-400">who to look at</span>,  
+            the MLP decides <span className="text-sky-400">what meaning to extract</span>.  
+            Together they turn raw tokens into intelligent reasoning.
+          </p>
+        </motion.div>
+      </motion.div>
+    </div>
+  );
+}
+

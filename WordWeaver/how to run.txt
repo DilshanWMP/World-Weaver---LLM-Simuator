@@ -1,0 +1,4 @@
+cd C:\Users\gdhas\All files\Project wordweaver\World-Weaver---LLM-Simuator\WordWeaver
+conda activate WordWeaver
+cd wordweaver-backend
+uvicorn main:app --reload --port 8000
