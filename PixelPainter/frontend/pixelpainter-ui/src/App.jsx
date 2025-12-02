@@ -1,3 +1,4 @@
+// File: src/App.jsx
 import { useState } from 'react'
 import PromptStation from './components/PromptStation'
 import EncoderStation from './components/EncoderStation'
@@ -6,6 +7,7 @@ import RefinementStation from './components/RefinementStation'
 import axios from 'axios'
 
 export default function App(){
+  const [prevSelection, setPrevSelection] = useState(null)
   const [prompt, setPrompt] = useState('')
   const [tokens, setTokens] = useState([])
   const [frames, setFrames] = useState([])
@@ -26,8 +28,10 @@ export default function App(){
     try {
       const res = await axios.post('http://localhost:8000/generate', { prompt: newPrompt })
       const frameFiles = res.data.frames || []
+      const prev = res.data.previous || null
       setTs(Date.now())
       setFrames(frameFiles)
+      setPrevSelection(prev)   // new
       setStatusText('Animating diffusion steps')
       const interval = setInterval(() => {
         setStep(prev => {
@@ -49,30 +53,30 @@ export default function App(){
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-850 to-slate-900 text-slate-100 p-8">
-      <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6">
-
-        {/* LEFT SIDEBAR */}
-        <div className="col-span-12 lg:col-span-4 space-y-6">
-          {/* Title */}
-          <div className="bg-slate-800/70 backdrop-blur-sm p-6 rounded-2xl shadow-lg">
-            <h2 className="text-3xl font-bold tracking-tight">🖌️ Pixel Painter</h2>
-            <p className="text-sm text-slate-400 mt-1 leading-relaxed">
-              Step-by-step demonstration of diffusion image generation.
-            </p>
-          </div>
-
-          {/* Prompt */}
-          <PromptStation onSubmit={generate} loading={loading} />
-
-          {/* Encoder Station */}
-          <EncoderStation tokens={tokens} />
+      
+      {/* Header with Icon */}
+      <div className="text-center mb-8">
+        <div className="flex items-center justify-center gap-3 mb-2">
+          <div className="text-4xl">🎨</div>
+          <h1 className="text-4xl font-bold">Pixel Painter</h1>
         </div>
+        <p className="text-slate-400 mt-2">Step-by-step diffusion generation demo</p>
+      </div>
 
-        {/* RIGHT SIDE */}
-        <div className="col-span-12 lg:col-span-8 space-y-6">
+      <div className="max-w-7xl mx-auto space-y-8">
+        
+        {/* Prompt Station - Top */}
+        <PromptStation onSubmit={generate} loading={loading} />
+
+        {/* Text Encoder Demo - Middle */}
+        <EncoderStation tokens={tokens} />
+
+        {/* Bottom Section: Diffusion Steps (Left) and Refinement (Right) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <DiffusionViewer frames={frames} step={step} setStep={setStep} ts={ts} />
-          <RefinementStation frames={frames} step={step} ts={ts} />
+          <RefinementStation frames={frames} step={step} ts={ts} prev={prevSelection} />
         </div>
+
       </div>
     </div>
   )
