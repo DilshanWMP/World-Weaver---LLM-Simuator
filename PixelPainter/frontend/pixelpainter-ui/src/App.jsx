@@ -5,6 +5,7 @@ import EncoderStation from './components/EncoderStation'
 import DiffusionViewer from './components/DiffusionViewer'
 import RefinementStation from './components/RefinementStation'
 import axios from 'axios'
+import TrainingDemo from './components/TrainingDemo';   // ← already imported
 
 export default function App(){
   const [prevSelection, setPrevSelection] = useState(null)
@@ -31,7 +32,7 @@ export default function App(){
       const prev = res.data.previous || null
       setTs(Date.now())
       setFrames(frameFiles)
-      setPrevSelection(prev)   // new
+      setPrevSelection(prev)
       setStatusText('Animating diffusion steps')
       const interval = setInterval(() => {
         setStep(prev => {
@@ -51,10 +52,14 @@ export default function App(){
     }
   }
 
+  // Compute final image URL to pass into TrainingDemo
+  const finalImageFile = frames.length ? frames[frames.length - 1] : null;
+  const finalImageUrl = finalImageFile ? `http://localhost:8000/static/${finalImageFile}` : null;
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-850 to-slate-900 text-slate-100 p-8">
       
-      {/* Header with Icon */}
+      {/* Header */}
       <div className="text-center mb-8">
         <div className="flex items-center justify-center gap-3 mb-2">
           <div className="text-4xl">🎨</div>
@@ -65,13 +70,22 @@ export default function App(){
 
       <div className="max-w-7xl mx-auto space-y-8">
         
-        {/* Prompt Station - Top */}
+        {/* Prompt Station (Top) */}
         <PromptStation onSubmit={generate} loading={loading} />
 
-        {/* Text Encoder Demo - Middle */}
+        {/* ⬇⬇⬇ INSERT TRAINING DEMO RIGHT HERE ⬇⬇⬇ */}
+        <TrainingDemo
+          finalImageUrl={finalImageUrl}
+          backwardFrames={frames}
+          ts={ts}
+          initialSteps={20}
+        />
+        {/* ⬆⬆⬆ INSERT TRAINING DEMO RIGHT HERE ⬆⬆⬆ */}
+
+        {/* Text Encoder Demo */}
         <EncoderStation tokens={tokens} />
 
-        {/* Bottom Section: Diffusion Steps (Left) and Refinement (Right) */}
+        {/* Diffusion + Refinement Section */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <DiffusionViewer frames={frames} step={step} setStep={setStep} ts={ts} />
           <RefinementStation frames={frames} step={step} ts={ts} prev={prevSelection} />

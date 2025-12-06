@@ -1,0 +1,678 @@
+============backend==============
+
+requirements.txt => 	fastapi
+			uvicorn
+			pydantic
+			starlette
+			Pillow
+			torch
+			diffusers
+			transformers
+			accelerate
+			safetensors
+			numpy
+
+--------generate_steps.py---------
+
+import sys
+import torch
+import os
+from diffusers import StableDiffusionPipeline
+from PIL import Image
+
+# get the prompt
+prompt = " ".join(sys.argv[1:])
+
+# load local model
+MODEL_PATH = "../sd15"
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.float16,
+    local_files_only=True
+)
+
+pipe = pipe.to("cuda")
+pipe.set_progress_bar_config(disable=True)
+
+# output folder
+os.makedirs("steps", exist_ok=True)
+
+# ---- REDUCED DIFFUSION STEPS ----
+num_steps = 10   # reduced from 30 → MUCH lower VRAM
+pipe.scheduler.set_timesteps(num_steps, device="cuda")
+
+# encode text prompt
+prompt_embeds, negative_embeds = pipe.encode_prompt(
+    prompt=prompt,
+    device="cuda",
+    num_images_per_prompt=1,
+    do_classifier_free_guidance=True
+)
+
+# ---- REDUCED RESOLUTION (384×384) ----
+latent_size = 48   # 48 × 8 = 384px output resolution
+
+latents = torch.randn(
+    (1, pipe.unet.config.in_channels, latent_size, latent_size),
+    device="cuda",
+    dtype=torch.float16
+)
+
+guidance_scale = 7.5
+
+# Safety: disable VAE gradients (faster)
+pipe.vae.eval()
+for p in pipe.vae.parameters():
+    p.requires_grad_(False)
+
+# ---- DIFFUSION LOOP ----
+for i, t in enumerate(pipe.scheduler.timesteps):
+
+    # classifier-free guidance requires 2 copies
+    latent_input = torch.cat([latents] * 2)
+
+    # forward UNet
+    with torch.amp.autocast("cuda"):
+        noise_pred = pipe.unet(
+            latent_input,
+            t,
+            encoder_hidden_states=torch.cat([negative_embeds, prompt_embeds])
+        ).sample
+
+    # CFG combine noise
+    noise_uncond, noise_text = noise_pred.chunk(2)
+    noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+    # update latents
+    latents = pipe.scheduler.step(noise_pred, t, latents).prev_sample
+
+    # ---- DECODE the image ----
+    with torch.no_grad():
+        with torch.amp.autocast("cuda"):
+            decoded = pipe.vae.decode(latents / 0.18215).sample
+
+        # format to real image
+        image = (decoded.detach().float().cpu().clamp(-1, 1) + 1) / 2
+        image = image.permute(0, 2, 3, 1)[0].numpy()
+        image = (image * 255).astype("uint8")
+        image = Image.fromarray(image)
+
+    # save each step
+    image.save(f"steps/step_{i:03}.png")
+
+print("✓ All 10 steps generated successfully!")
+
+
+--------download_model.py---------
+
+from diffusers import StableDiffusionPipeline
+import torch
+
+print("Downloading model...")
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16
+)
+
+pipe.save_pretrained("sd15")
+
+print("Model downloaded and saved!")
+
+
+--------api.py---------
+
+import os
+import subprocess
+import glob
+import shutil
+import datetime
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.staticfiles import StaticFiles
+
+app = FastAPI()
+
+# Allow frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# REAL steps directory is backend/steps
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STEPS_DIR = os.path.join(BASE_DIR, "steps")
+
+print("SERVING STATIC FROM:", STEPS_DIR)
+
+# Serve backend/steps to frontend
+app.mount("/static", StaticFiles(directory=STEPS_DIR), name="static")
+
+
+class Prompt(BaseModel):
+    prompt: str
+
+def _select_start_mid_final(sorted_files):
+    count = len(sorted_files)
+    if count == 0:
+        return None
+    start = sorted_files[0]
+    middle = sorted_files[count // 2]
+    final = sorted_files[-1]
+    return {"start": start, "middle": middle, "final": final}
+
+@app.post("/generate")
+def generate_image(data: Prompt):
+    prompt = data.prompt
+
+    # 1) Collect existing frames (if any)
+    existing = sorted(glob.glob(f"{STEPS_DIR}/*.png"))
+    existing = sorted(existing)
+
+    prev_info = None
+    prev_dir = os.path.join(STEPS_DIR, "prev")
+    os.makedirs(prev_dir, exist_ok=True)
+
+    if existing:
+        # 2) Pick start/middle/final from existing frames
+        sel = _select_start_mid_final(existing)
+        if sel:
+            # Clear previous folder contents (so only these three files remain)
+            for f in glob.glob(os.path.join(prev_dir, "*")):
+                try:
+                    if os.path.isfile(f):
+                        os.remove(f)
+                    else:
+                        shutil.rmtree(f)
+                except Exception:
+                    pass
+
+            # Copy selected files into prev folder with fixed names
+            try:
+                shutil.copy(sel["start"], os.path.join(prev_dir, "start.png"))
+                shutil.copy(sel["middle"], os.path.join(prev_dir, "middle.png"))
+                shutil.copy(sel["final"], os.path.join(prev_dir, "final.png"))
+                prev_info = {
+                    "start": "prev/start.png",
+                    "middle": "prev/middle.png",
+                    "final": "prev/final.png",
+                }
+            except Exception as e:
+                # If copy fails, ignore but log
+                print("Warning: failed to copy previous selection:", e)
+
+    # 3) Delete existing frames (so generator can write fresh files)
+    for f in existing:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+    # 4) Run generator (same as before)
+    subprocess.run(
+        ["python", "generate_steps.py"] + prompt.split(),
+        cwd=BASE_DIR,
+    )
+
+    # 5) Collect generated images
+    files = sorted(glob.glob(f"{STEPS_DIR}/*.png"))
+    filenames = [os.path.basename(f) for f in files]
+
+    # 6) Return both current frames and previous selection (if any)
+    return {"frames": filenames, "previous": prev_info}
+
+============frontend==============
+
+--------package.json---------
+
+{
+  "name": "pixelpainter-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "tailwind:watch": "tailwindcss -i ./src/index.css -o ./dist/output.css --watch"
+  },
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "axios": "^1.13.2",
+    "framer-motion": "^12.23.24",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@tailwindcss/cli": "^4.1.17",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "autoprefixer": "^10.4.22",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "postcss": "^8.5.6",
+    "vite": "^7.2.4"
+  }
+}
+
+
+--------main.jsx---------
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css"; 
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+
+--------index.css---------
+
+@import "tailwindcss";
+
+html, body, #root { height: 100%; }
+body { -webkit-font-smoothing: antialiased; }
+
+/* small helpers */
+.token-pill { background: rgba(255,255,255,0.04); padding: 6px 10px; border-radius: 999px; }
+
+--------App.jsx---------
+
+// File: src/App.jsx
+import { useState } from 'react'
+import PromptStation from './components/PromptStation'
+import EncoderStation from './components/EncoderStation'
+import DiffusionViewer from './components/DiffusionViewer'
+import RefinementStation from './components/RefinementStation'
+import axios from 'axios'
+
+export default function App(){
+  const [prevSelection, setPrevSelection] = useState(null)
+  const [prompt, setPrompt] = useState('')
+  const [tokens, setTokens] = useState([])
+  const [frames, setFrames] = useState([])
+  const [step, setStep] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [ts, setTs] = useState(Date.now())
+  const [statusText, setStatusText] = useState('')
+
+  async function generate(newPrompt){
+    setPrompt(newPrompt)
+    setFrames([])
+    setStep(0)
+    setStatusText('Tokenizing...')
+    const toks = newPrompt.split(/(\s+)/).filter(t => t.trim().length > 0)
+    setTokens(toks)
+    setLoading(true)
+    setStatusText('Requesting image generation...')
+    try {
+      const res = await axios.post('http://localhost:8000/generate', { prompt: newPrompt })
+      const frameFiles = res.data.frames || []
+      const prev = res.data.previous || null
+      setTs(Date.now())
+      setFrames(frameFiles)
+      setPrevSelection(prev)   // new
+      setStatusText('Animating diffusion steps')
+      const interval = setInterval(() => {
+        setStep(prev => {
+          if(prev >= frameFiles.length - 1){
+            clearInterval(interval)
+            setStatusText('Generation complete')
+            setLoading(false)
+            return prev
+          }
+          return prev + 1
+        })
+      }, 700)
+    } catch(e){
+      console.error(e)
+      setStatusText('Generation failed: ' + (e.message||e))
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-850 to-slate-900 text-slate-100 p-8">
+      
+      {/* Header with Icon */}
+      <div className="text-center mb-8">
+        <div className="flex items-center justify-center gap-3 mb-2">
+          <div className="text-4xl">🎨</div>
+          <h1 className="text-4xl font-bold">Pixel Painter</h1>
+        </div>
+        <p className="text-slate-400 mt-2">Step-by-step diffusion generation demo</p>
+      </div>
+
+      <div className="max-w-7xl mx-auto space-y-8">
+        
+        {/* Prompt Station - Top */}
+        <PromptStation onSubmit={generate} loading={loading} />
+
+        {/* Text Encoder Demo - Middle */}
+        <EncoderStation tokens={tokens} />
+
+        {/* Bottom Section: Diffusion Steps (Left) and Refinement (Right) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          <DiffusionViewer frames={frames} step={step} setStep={setStep} ts={ts} />
+          <RefinementStation frames={frames} step={step} ts={ts} prev={prevSelection} />
+        </div>
+
+      </div>
+    </div>
+  )
+}
+
+--------App.css---------
+
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+
+
+====compnents folder====
+--------RefinementStation.jsx---------
+
+export default function RefinementStation({ frames = [], step = 0, ts = 0, prev = null }) {
+
+  const makeUrl = (rel) => rel ? `http://localhost:8000/static/${rel}?t=${ts}` : null
+
+  // Current run selection
+  const currStart = frames.length ? frames[0] : null
+  const currMiddle = frames.length ? frames[Math.floor(frames.length / 2)] : null
+  const currFinal = frames.length ? frames[frames.length - 1] : null
+
+  const prevStart = prev ? prev.start : null
+  const prevMiddle = prev ? prev.middle : null
+  const prevFinal = prev ? prev.final : null
+
+  const imgCard = (src, label) => (
+    <div className="text-center">
+      <div className="text-sm text-slate-300 mb-2">{label}</div>
+      <div className="w-40 h-40 bg-black rounded-xl border border-slate-700 overflow-hidden flex items-center justify-center mx-auto">
+        {src ? <img src={src} className="object-cover w-full h-full" alt={label} /> : <div className="text-slate-500 p-6">—</div>}
+      </div>
+    </div>
+  )
+
+  return (
+    <div className="bg-slate-800/70 backdrop-blur-sm p-6 rounded-2xl shadow-lg">
+      <h3 className="text-2xl font-semibold mb-2">Refinement Stage</h3>
+      <p className="text-sm text-slate-400 mb-4">Compare start / middle / final of previous and current generations.</p>
+
+      <div className="space-y-6">
+        {/* Previous run */}
+        <div>
+          <div className="text-sm text-slate-300 mb-3">Previous Generation</div>
+          <div className="flex gap-4 items-start">
+            {imgCard(makeUrl(prevStart), 'Start')}
+            {imgCard(makeUrl(prevMiddle), 'Middle')}
+            {imgCard(makeUrl(prevFinal), 'Final')}
+          </div>
+        </div>
+
+        {/* Current run */}
+        <div>
+          <div className="text-sm text-slate-300 mb-3">Current Generation</div>
+          <div className="flex gap-4 items-start">
+            {imgCard(makeUrl(currStart), 'Start')}
+            {imgCard(makeUrl(currMiddle), 'Middle')}
+            {imgCard(makeUrl(currFinal), 'Final')}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+--------PromptStation.jsx---------
+
+// File: src/components/PromptStation.jsx
+import { useState } from 'react'
+
+export default function PromptStation({ onSubmit, loading }){
+
+  const [value, setValue] = useState('A red fox in a misty forest')
+
+  const examples = [
+    'A cute kitten playing with yarn',
+    'Colorful flowers in a garden',
+    'A happy puppy in a field',
+    'Sunset over mountains',
+    'Butterflies in a meadow',
+    'A cozy cabin in snow',
+    'Rainbow over hills',
+    'Dolphins jumping in ocean'
+  ]
+
+  return (
+    <div className="bg-slate-800/70 backdrop-blur-sm p-6 rounded-2xl shadow-lg">
+      <div className="space-y-4">
+        <textarea
+          className="w-full p-4 rounded-xl bg-slate-900 text-slate-100 border border-slate-700 text-lg"
+          rows={2}
+          value={value}
+          onChange={(e)=>setValue(e.target.value)}
+          placeholder="Enter your prompt here..."
+        />
+        
+        <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+          <button
+            disabled={loading}
+            onClick={()=> onSubmit(value)}
+            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-xl text-white font-medium text-base whitespace-nowrap"
+          >
+            {loading ? 'Generating...' : 'Generate'}
+          </button>
+          
+          <div className="flex flex-wrap gap-2">
+            {examples.map((ex, i)=>(
+              <button 
+                key={i} 
+                onClick={()=> setValue(ex)} 
+                className="text-sm px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 transition-colors border border-slate-600"
+              >
+                {ex}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+--------EncoderStation.jsx---------
+
+// File: src/components/EncoderStation.jsx
+import { useState } from "react";
+
+export default function EncoderStation({ tokens = [] }) {
+  // Professional feature labels for image generation
+  const featureLabels = ["Visual Concept", "Color Palette", "Style/Texture", "Composition", "Lighting/Mood", "Context/Setting", "..."];
+
+  // For demo: embeddings for each token (numbers between 0-1)
+  const embeddings = tokens.map((token) =>
+    featureLabels.slice(0, -1).map(() => (Math.random() * 1).toFixed(2))
+  );
+
+  return (
+    <div className="bg-slate-800/70 backdrop-blur-sm p-6 rounded-2xl shadow-lg">
+      <h3 className="text-2xl font-semibold mb-4">Text Encoder Demo</h3>
+      <p className="text-sm text-slate-400 mb-6 leading-relaxed">
+        The text encoder converts your prompt into numerical embeddings that guide the image generation process. 
+        Each token is mapped to semantic features that influence visual attributes in the final image.
+      </p>
+
+      {/* Tokens */}
+      <div className="mb-6">
+        <h4 className="text-sm font-medium text-slate-300 mb-3">Tokens</h4>
+        <div className="flex flex-wrap gap-2">
+          {tokens.map((t, i) => (
+            <div key={i} className="px-3 py-1 rounded-full bg-slate-700 text-xs border border-slate-600">
+              {t}
+            </div>
+          ))}
+        </div>
+        <p className="text-xs text-slate-500 mt-2">
+          Each token represents a meaningful piece of your prompt that the AI processes individually.
+        </p>
+      </div>
+
+      {/* Encoder with semantic features */}
+      <div className="mb-6">
+        <h4 className="text-sm font-medium text-slate-300 mb-3">Text Encoder & Embeddings</h4>
+        <p className="text-xs text-slate-500 mb-4">
+          Each token is converted into a vector capturing semantic features that influence different aspects of image generation.
+        </p>
+
+        <div className="space-y-3">
+          {tokens.map((token, i) => (
+            <div key={i} className="bg-slate-900 p-3 rounded-lg border border-slate-700">
+              <div className="text-sm font-medium mb-2 text-slate-200">"{token}"</div>
+              <div className="grid grid-cols-2 gap-2">
+                {featureLabels.slice(0, -1).map((label, j) => (
+                  <div key={j} className="flex items-center gap-2">
+                    <span className="text-xs text-slate-400 w-20 truncate">{label}</span>
+                    <div className="flex-1 bg-slate-700 rounded-full h-2">
+                      <div
+                        className="h-2 bg-indigo-500 rounded-full"
+                        style={{ width: `${embeddings[i][j] * 100}%` }}
+                      ></div>
+                    </div>
+                    <span className="text-xs text-slate-300 w-8 text-right">{embeddings[i][j]}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Table preview */}
+      <div>
+        <h4 className="text-sm font-medium text-slate-300 mb-3">Embedding Vector Table</h4>
+        <p className="text-xs text-slate-500 mb-3">
+          Numerical representation of token semantics. Higher values indicate stronger association with each visual feature.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="table-auto border-collapse border border-slate-700 text-xs w-full">
+            <thead>
+              <tr className="bg-slate-800">
+                <th className="border border-slate-600 px-3 py-2 text-left">Token</th>
+                {featureLabels.map((f, i) => (
+                  <th key={i} className="border border-slate-600 px-2 py-2 text-center">{f}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {tokens.map((token, i) => (
+                <tr key={i} className="hover:bg-slate-750">
+                  <td className="border border-slate-600 px-3 py-2 font-medium text-left">{token}</td>
+                  {embeddings[i].map((v, j) => (
+                    <td key={j} className="border border-slate-600 px-2 py-2 text-center">{v}</td>
+                  ))}
+                  <td className="border border-slate-600 px-2 py-2 text-center text-slate-500">...</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+--------DiffusionViewer.jsx---------
+
+// DiffusionViewer.jsx — Improved UI
+
+import { useEffect } from 'react'
+
+export default function DiffusionViewer({ frames = [], step = 0, setStep, ts=0 }) {
+
+  useEffect(()=>{ setStep(0) }, [frames])
+
+  const src = frames.length ? `http://localhost:8000/static/${frames[step]}?t=${ts}` : null
+
+  return (
+    <div className="bg-slate-800/70 p-5 rounded-2xl shadow-lg">
+      <h3 className="text-xl font-semibold">🔄 Diffusion Steps</h3>
+      <p className="text-sm text-slate-400">See how noise gradually forms an image.</p>
+
+      <div className="mt-4 flex flex-col items-center">
+
+        <div className="w-[384px] h-[384px] bg-black rounded-xl border border-slate-700 overflow-hidden flex items-center justify-center">
+          {src ? <img src={src} alt="frame" className="object-cover w-full h-full" /> : <div className="text-slate-500">No frames</div>}
+        </div>
+
+        <div className="mt-4 flex items-center gap-3">
+          <button onClick={()=> setStep(Math.max(0, step-1))} className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded">Prev</button>
+          <button onClick={()=> setStep(Math.min(frames.length-1, step+1))} className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded">Next</button>
+          <div className="text-sm text-slate-300 ml-3">Step {step+1} / {frames.length}</div>
+        </div>
+
+        <input
+          type="range"
+          min={0}
+          max={Math.max(0, frames.length-1)}
+          value={step}
+          onChange={(e)=> setStep(parseInt(e.target.value))}
+          className="w-[380px] mt-4 accent-blue-500"
+        />
+      </div>
+    </div>
+  )
+}
