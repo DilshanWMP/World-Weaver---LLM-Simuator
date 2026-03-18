@@ -132,6 +132,8 @@ export default function Home() {
 
           {/* Next-word probabilities */}
           <ProbChart candidates={candidates} probs={probs} />
+
+          <OutputBox output={output} lastToken={lastToken} />
         </div>
 
       </div>
