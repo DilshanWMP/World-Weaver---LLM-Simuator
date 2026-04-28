@@ -32,7 +32,7 @@ Both projects emphasize running state-of-the-art AI locally without relying on e
 Each project has its own dedicated setup instructions. Navigate to the respective project directories to learn how to install dependencies and run the servers:
 
 - 📖 [WordWeaver Setup Instructions](./WordWeaver/README.md)
-- 📖 [PixelPainter Setup Instructions](./PixelPainter/README.txt)
+- 📖 [PixelPainter Setup Instructions](./PixelPainter/README.md)
 
 ---
 *Note: Ensure you have Python 3.10+, Node.js (v18+), and Conda installed before setting up the projects.*
