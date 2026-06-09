@@ -89,7 +89,8 @@ def load_model_and_tokenizer(mname: str):
                 mname,
                 quantization_config=bnb_config,
                 device_map="auto",
-                trust_remote_code=True
+                trust_remote_code=True,
+                attn_implementation="eager"
             )
             return model, tokenizer
         except Exception as e:
@@ -102,14 +103,15 @@ def load_model_and_tokenizer(mname: str):
                 mname,
                 device_map="auto",
                 torch_dtype=torch.float16,
-                trust_remote_code=True
+                trust_remote_code=True,
+                attn_implementation="eager"
             )
             return model, tokenizer
         except Exception as e:
             st.warning(f"fp16 load failed: {e} — falling back to CPU.")
 
     # CPU fallback
-    model = AutoModelForCausalLM.from_pretrained(mname, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(mname, trust_remote_code=True, attn_implementation="eager")
     return model, tokenizer
 
 # load model/tokenizer (this may take time on first run)

@@ -13,7 +13,8 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     quantization_config=bnb,
     device_map="auto",
-    trust_remote_code=True
+    trust_remote_code=True,
+    attn_implementation="eager"
 )
 
 # ---- existing next-token function ----
